@@ -38,6 +38,27 @@ AGENTS = {
     "A": {"name": LLM_A_LABEL, "symbol": "X", "model": LLM_A_MODEL},
     "B": {"name": LLM_B_LABEL, "symbol": "O", "model": LLM_B_MODEL},
 }
+
+
+def minimax_fee_details(agent_key: str) -> Dict[str, int]:
+    """Compute the current minimax entry fee and its components."""
+    base_fee = 10
+    opponent_key = "B" if agent_key == "A" else "A"
+    points_agent = st.session_state.tournament_points.get(agent_key, 0)
+    points_opponent = st.session_state.tournament_points.get(opponent_key, 0)
+    score_gap = points_agent - points_opponent
+    deficit = max(0, -score_gap)
+    discount_steps = min(9, deficit // 10)
+    adjustment = -discount_steps
+    dynamic_fee = max(1, min(5, base_fee + adjustment))
+    return {
+        "fee": dynamic_fee,
+        "base_fee": base_fee,
+        "adjustment": adjustment,
+        "score_gap": score_gap,
+        "agent_points": points_agent,
+        "opponent_points": points_opponent,
+    }
 MAX_GAMES = 5
 MAX_LLM_RETRIES = 3
 OPENING_SEQUENCE = [0, 2, 6, 8, 4, 1, 3, 5, 7]
@@ -159,6 +180,8 @@ def ensure_state() -> None:
         st.session_state.model_a_choice = DEFAULT_LLM_A_MODEL
     if "model_b_choice" not in st.session_state:
         st.session_state.model_b_choice = DEFAULT_LLM_B_MODEL
+    if "allow_minimax" not in st.session_state:
+        st.session_state.allow_minimax = True
     if "available_models" not in st.session_state:
         st.session_state.available_models = []
     if "pregame_decided" not in st.session_state:
@@ -465,16 +488,31 @@ def llm_decide_minimax(agent_key: str) -> Tuple[bool, str, int]:
         1 for e in st.session_state.scoreboard if e["winner"] == opponent_key
     )
     draws = sum(1 for e in st.session_state.scoreboard if e["winner"] == "Draw")
-    usage_count = st.session_state.minimax_usage_count.get(agent_key, 0)
-    next_fee = 5 * (usage_count + 1)
+    fee_info = minimax_fee_details(agent_key)
+    next_fee = fee_info["fee"]
+    adjustment_str = (
+        f"{fee_info['adjustment']:+d}"
+        if isinstance(fee_info["adjustment"], int)
+        else str(fee_info["adjustment"])
+    )
+    score_gap = fee_info["score_gap"]
+    if score_gap < 0:
+        gap_phrase = f"{-score_gap} point deficit"
+    elif score_gap > 0:
+        gap_phrase = f"{score_gap} point lead"
+    else:
+        gap_phrase = "tied scoreboard"
+    current_game = st.session_state.game_number
+    games_remaining = max(0, MAX_GAMES - current_game + 1)
     prompt = f"""
 You are {agent['name']} preparing for Game {st.session_state.game_number}.
 
 Current record: you {wins_agent} wins, opponent {wins_opponent} wins, {draws} draws.
 Tournament points: you {points_agent}, opponent {points_opponent}.
+Series progress: Game {current_game} of {MAX_GAMES}; {games_remaining} game(s) remain including this one.
 
 Before this game starts you must decide if you want the perfect-play minimax engine to handle ALL of your moves.
-- Your next minimax attempt costs {next_fee} points (fees rise each use) and is never refunded, even if it pushes your score negative.
+- Your next minimax attempt costs {next_fee} points (base {fee_info['base_fee']} with score-gap adjustment {adjustment_str} reflecting the current tournament gap: {gap_phrase}) and is never refunded, even if it pushes your score negative.
 - If you are currently ahead on tournament points, you are not allowed to choose minimax (tie or trailing only).
 - Wins always award +10 points (whether you used minimax or not); losses and draws award 0.
 - If you play manually you avoid the entry fee but still face the usual win/loss scoring.
@@ -511,9 +549,23 @@ Return ONLY JSON:
 def ensure_pregame_minimax_choices() -> None:
     if st.session_state.pregame_decided:
         return
+    if not st.session_state.allow_minimax:
+        st.session_state.minimax_flags = {"A": False, "B": False}
+        st.session_state.minimax_fee_paid = {"A": 0, "B": 0}
+        st.session_state.llm_status = (
+            "Minimax assistance is disabled for this game. Both agents will play manually."
+        )
+        st.session_state.pregame_decided = True
+        return
     messages: List[str] = []
     for agent_key in ("A", "B"):
         use_minimax, warning, next_fee = llm_decide_minimax(agent_key)
+        fee_info = minimax_fee_details(agent_key)
+        adjustment_str = (
+            f"{fee_info['adjustment']:+d}"
+            if isinstance(fee_info["adjustment"], int)
+            else str(fee_info["adjustment"])
+        )
         if warning:
             st.session_state.minimax_flags[agent_key] = False
             st.session_state.minimax_fee_paid[agent_key] = 0
@@ -540,14 +592,14 @@ def ensure_pregame_minimax_choices() -> None:
             )
             messages.append(
                 f"{AGENTS[agent_key]['name']} locked in minimax for Game "
-                f"{st.session_state.game_number} (entry fee −{next_fee})."
+                f"{st.session_state.game_number} (entry fee −{next_fee}; base {fee_info['base_fee']}, score gap {fee_info['score_gap']}, adj {adjustment_str})."
             )
         elif use_minimax and points_agent < next_fee:
             st.session_state.minimax_flags[agent_key] = False
             st.session_state.minimax_fee_paid[agent_key] = 0
             messages.append(
                 f"{AGENTS[agent_key]['name']} wanted minimax but needs {next_fee} points and only has "
-                f"{points_agent}, so will play manually."
+                f"{points_agent} (base {fee_info['base_fee']}, score gap {fee_info['score_gap']}, adj {adjustment_str}), so will play manually."
             )
         else:
             st.session_state.minimax_fee_paid[agent_key] = 0
@@ -668,6 +720,7 @@ def finish_game(winner_symbol: Optional[str]) -> None:
             "game": current_game,
             "winner": winner,
             "starter": starter,
+            "move_count": len(st.session_state.moves_this_game),
             "A_used_minimax": st.session_state.minimax_flags["A"],
             "B_used_minimax": st.session_state.minimax_flags["B"],
             "A_tokens": st.session_state.current_tokens["A"],
@@ -769,6 +822,14 @@ with st.sidebar:
     )
     st.session_state.model_a_choice = selected_model_a
     st.session_state.model_b_choice = selected_model_b
+    st.session_state.allow_minimax = st.checkbox(
+        "Allow minimax helper",
+        value=st.session_state.allow_minimax,
+        help=(
+            "When enabled, each agent may pay a fee to delegate the entire game to minimax. "
+            "Fees stay between 1 and 10 points and drop as the current tournament deficit grows."
+        ),
+    )
 
 LLM_A_MODEL = st.session_state.model_a_choice
 LLM_B_MODEL = st.session_state.model_b_choice
@@ -782,11 +843,12 @@ AGENTS["B"]["model"] = LLM_B_MODEL
 st.title(f"🤖 {LLM_A_LABEL} vs {LLM_B_LABEL} — Tic Tac Toe Series")
 st.caption(
     "Before each showdown the agents decide whether to hand control to the perfect-play minimax helper "
-    "for the entire match—no mid-game bailouts. Press start to watch a five-game run. Defaults pit "
-    "GPT-3.5-turbo against GPT-4o-mini; override via TICTAC_LLM_A_MODEL / TICTAC_LLM_B_MODEL. "
+    "for the entire match—no mid-game bailouts—and you can globally permit or disable that helper in the sidebar. "
+    "Press start to watch a five-game run. Defaults pit GPT-3.5-turbo against GPT-4o-mini; override via "
+    "TICTAC_LLM_A_MODEL / TICTAC_LLM_B_MODEL. "
     f"Current matchup — {LLM_A_LABEL} ({LLM_A_MODEL}) vs {LLM_B_LABEL} ({LLM_B_MODEL}). "
-    "Tournament scoring: win = +10 pts, loss/draw = 0 pts, and each successive minimax use gets pricier "
-    "(5, 10, 15… points, never refunded)."
+    "Tournament scoring: win = +10 pts, loss/draw = 0 pts, and minimax fees now stay between 1–10 points, "
+    "starting at 10 while tied or leading and dropping by 1 for each 10-point deficit."
 )
 
 col_controls = st.columns([1, 1, 1])
@@ -834,6 +896,17 @@ if st.session_state.get("opening_seed") is not None:
     st.caption(f"Opening seed: {st.session_state.opening_seed}")
 
 st.write(st.session_state.llm_status or "Press start to begin the series.")
+if st.session_state.allow_minimax:
+    fee_a = minimax_fee_details("A")
+    fee_b = minimax_fee_details("B")
+    st.caption(
+        f"Next minimax entry fees — {AGENTS['A']['name']}: {fee_a['fee']} pts "
+        f"(base {fee_a['base_fee']}, score gap {fee_a['score_gap']}, adj {fee_a['adjustment']:+d}); "
+        f"{AGENTS['B']['name']}: {fee_b['fee']} pts "
+        f"(base {fee_b['base_fee']}, score gap {fee_b['score_gap']}, adj {fee_b['adjustment']:+d})."
+    )
+else:
+    st.caption("Minimax helper disabled — every move will be LLM-driven without perfect-play overrides.")
 
 st.subheader("Scoreboard")
 scoreboard_entries = st.session_state.scoreboard
@@ -855,13 +928,14 @@ if scoreboard_entries:
                 "Winner": (
                     "Draw"
                     if entry["winner"] == "Draw"
-                    else AGENTS[entry["winner"]]["name"]
+                    else AGENTS[entry["winner"]]["symbol"]
                 ),
                 "Starter": (
                     f"{AGENTS[entry['starter']]['name']} ({AGENTS[entry['starter']]['symbol']})"
                     if entry.get("starter") in AGENTS
                     else entry.get("starter", "?")
                 ),
+                "Moves to Finish": entry.get("move_count", 0),
                 f"{display_name_a} Minimax?": "Yes" if entry["A_used_minimax"] else "No",
                 f"{display_name_b} Minimax?": "Yes" if entry["B_used_minimax"] else "No",
                 f"{display_name_a} Tokens": entry.get("A_tokens", 0),
@@ -874,9 +948,9 @@ if scoreboard_entries:
     )
     score_cols = st.columns(2)
     with score_cols[0]:
-        st.metric(f"{display_name_a} cumulative score", st.session_state.tournament_points["A"])
+        st.metric(f"{display_name_a} wins", wins_a)
     with score_cols[1]:
-        st.metric(f"{display_name_b} cumulative score", st.session_state.tournament_points["B"])
+        st.metric(f"{display_name_b} wins", wins_b)
     st.caption(
         f"Series tally — {display_name_a}: {wins_a} wins, "
         f"{display_name_b}: {wins_b} wins, Draws: {draws}."
@@ -1003,10 +1077,12 @@ with st.expander("How it works"):
         """
         Two OpenAI LLM agents (defaults: `gpt-3.5-turbo` vs `gpt-4o-mini`) take turns playing
         Tic Tac Toe. Before each game they examine the tournament score and decide—via prompt—
-        whether to delegate every move to the perfect-play minimax engine. Opting in immediately
-        costs 5 points for the first use, 10 for the second, 15 for the third, and so on—fees are
-        never refunded—while wins always grant +10 points and losses/draws pay 0. There are no
-        mid-game requests, so the choice is locked at the opening move.
+        whether to delegate every move to the perfect-play minimax engine (if the sidebar toggle
+        allows it). Opting in costs between 1 and 10 tournament points: it's 10 points while tied
+        or leading, then drops by 1 for every 10-point deficit (down to 1) so trailing agents get
+        an increasingly cheap bailout. No entry fee is ever refunded.
+        Fees are never refunded, wins always grant +10 points, and losses/draws pay 0. There are
+        no mid-game requests, so the choice is locked at the opening move.
         Press Start to watch five games with randomized opening seeds. After each matchup the app
         logs who won, whether minimax was used, token usage, and cumulative standings. If an LLM
         sends malformed JSON or repeats illegal moves we retry a few times; persistent problems
