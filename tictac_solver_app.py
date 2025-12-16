@@ -1,5 +1,6 @@
 import json
 import os
+import random
 from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -37,7 +38,7 @@ AGENTS = {
     "A": {"name": LLM_A_LABEL, "symbol": "X", "model": LLM_A_MODEL},
     "B": {"name": LLM_B_LABEL, "symbol": "O", "model": LLM_B_MODEL},
 }
-MAX_GAMES = 25
+MAX_GAMES = 5
 MAX_LLM_RETRIES = 3
 OPENING_SEQUENCE = [0, 2, 6, 8, 4, 1, 3, 5, 7]
 
@@ -52,11 +53,30 @@ WINNING_LINES = [
     (2, 4, 6),
 ]
 
+WIN_LINE_CLASS_MAP = {
+    (0, 1, 2): "line-h0",
+    (3, 4, 5): "line-h1",
+    (6, 7, 8): "line-h2",
+    (0, 3, 6): "line-v0",
+    (1, 4, 7): "line-v1",
+    (2, 5, 8): "line-v2",
+    (0, 4, 8): "line-d0",
+    (2, 4, 6): "line-d1",
+}
+
+
+def get_winning_line(board: List[str]) -> Optional[Tuple[int, int, int]]:
+    for line in WINNING_LINES:
+        a, b, c = line
+        if board[a] and board[a] == board[b] == board[c]:
+            return line
+    return None
+
 
 def check_winner(board: List[str]) -> Optional[str]:
-    for a, b, c in WINNING_LINES:
-        if board[a] and board[a] == board[b] == board[c]:
-            return board[a]
+    winning_line = get_winning_line(board)
+    if winning_line:
+        return board[winning_line[0]]
     if "" not in board:
         return "Draw"
     return None
@@ -123,6 +143,10 @@ def ensure_state() -> None:
         st.session_state.opening_index = 0
     if "opening_move_done" not in st.session_state:
         st.session_state.opening_move_done = False
+    if "opening_seed" not in st.session_state:
+        st.session_state.opening_seed = None
+    if "opening_sequence" not in st.session_state:
+        refresh_opening_sequence()
     if "current_tokens" not in st.session_state:
         st.session_state.current_tokens = {"A": 0, "B": 0}
     if "moves_this_game" not in st.session_state:
@@ -143,6 +167,14 @@ def ensure_state() -> None:
         st.session_state.minimax_fee_paid = {"A": 0, "B": 0}
     if "minimax_usage_count" not in st.session_state:
         st.session_state.minimax_usage_count = {"A": 0, "B": 0}
+    if "winning_line" not in st.session_state:
+        st.session_state.winning_line = None
+    if "last_finished_board" not in st.session_state:
+        st.session_state.last_finished_board: Optional[List[str]] = None
+    if "last_finished_line" not in st.session_state:
+        st.session_state.last_finished_line: Optional[Tuple[int, int, int]] = None
+    if "last_finished_game" not in st.session_state:
+        st.session_state.last_finished_game: Optional[int] = None
 
 
 def reset_board() -> None:
@@ -155,6 +187,7 @@ def reset_board() -> None:
     st.session_state.moves_this_game = []
     st.session_state.pregame_decided = False
     st.session_state.minimax_fee_paid = {"A": 0, "B": 0}
+    st.session_state.winning_line = None
 
 
 def reset_series() -> None:
@@ -166,7 +199,21 @@ def reset_series() -> None:
     st.session_state.move_history = []
     st.session_state.tournament_points = {"A": 0, "B": 0}
     st.session_state.minimax_usage_count = {"A": 0, "B": 0}
+    st.session_state.last_finished_board = None
+    st.session_state.last_finished_line = None
+    st.session_state.last_finished_game = None
+    refresh_opening_sequence()
     reset_board()
+
+
+def refresh_opening_sequence(seed: Optional[int] = None) -> None:
+    if seed is None:
+        seed = random.randint(0, 2**31 - 1)
+    rng = random.Random(seed)
+    sequence = OPENING_SEQUENCE[:]
+    rng.shuffle(sequence)
+    st.session_state.opening_sequence = sequence
+    st.session_state.opening_seed = seed
 
 
 def load_model_library() -> List[str]:
@@ -200,8 +247,9 @@ def load_model_library() -> List[str]:
 def seed_opening_move() -> None:
     if st.session_state.opening_move_done:
         return
-    seq_idx = st.session_state.opening_index % len(OPENING_SEQUENCE)
-    board_idx = OPENING_SEQUENCE[seq_idx]
+    opening_sequence = st.session_state.get("opening_sequence", OPENING_SEQUENCE)
+    seq_idx = st.session_state.opening_index % len(opening_sequence)
+    board_idx = opening_sequence[seq_idx]
     st.session_state.opening_index += 1
 
     agent_key = st.session_state.current_player
@@ -224,13 +272,23 @@ def board_as_grid(board: List[str]) -> List[List[str]]:
     return [board[i : i + 3] for i in range(0, 9, 3)]
 
 
-def render_board(board: List[str]) -> None:
+def render_board(
+    board: List[str], winning_line: Optional[Tuple[int, int, int]] = None
+) -> None:
+    line_key = tuple(winning_line) if winning_line else None
+    line_class = WIN_LINE_CLASS_MAP.get(line_key, "") if line_key else ""
+    overlay_class = f" {line_class}" if line_class else ""
+    winning_cells = set(line_key or [])
     html = """
     <style>
     .ttt-wrapper {
         display: flex;
         justify-content: center;
         margin: 1rem 0 1.5rem;
+    }
+    .ttt-grid-container {
+        position: relative;
+        display: inline-block;
     }
     .ttt-grid {
         display: grid;
@@ -257,9 +315,40 @@ def render_board(board: List[str]) -> None:
     .ttt-cell:nth-last-child(-n+3) { border-bottom: none; }
     .ttt-cell.x { color: #ff5e5b; }
     .ttt-cell.o { color: #4b7bff; }
+    .ttt-cell.win {
+        background: linear-gradient(135deg, rgba(249,235,160,0.9), rgba(255,200,87,0.9));
+        box-shadow: inset 0 0 10px rgba(0,0,0,0.2);
+    }
+    .ttt-overlay {
+        position: absolute;
+        top: 6px;
+        left: 6px;
+        width: 360px;
+        height: 360px;
+        pointer-events: none;
+        z-index: 2;
+    }
+    .ttt-overlay line {
+        stroke: #27ae60;
+        stroke-width: 12px;
+        stroke-linecap: round;
+        opacity: 0;
+        filter: drop-shadow(0 0 6px rgba(0,0,0,0.25));
+    }
+    .ttt-overlay.line-h0 .line-h0,
+    .ttt-overlay.line-h1 .line-h1,
+    .ttt-overlay.line-h2 .line-h2,
+    .ttt-overlay.line-v0 .line-v0,
+    .ttt-overlay.line-v1 .line-v1,
+    .ttt-overlay.line-v2 .line-v2,
+    .ttt-overlay.line-d0 .line-d0,
+    .ttt-overlay.line-d1 .line-d1 {
+        opacity: 1;
+    }
     </style>
     <div class="ttt-wrapper">
-      <div class="ttt-grid">
+      <div class="ttt-grid-container">
+        <div class="ttt-grid">
     """
     for idx, value in enumerate(board):
         cls = ""
@@ -267,9 +356,22 @@ def render_board(board: List[str]) -> None:
             cls = "x"
         elif value == "O":
             cls = "o"
+        if idx in winning_cells:
+            cls += " win"
         symbol = value if value else "&nbsp;"
         html += f'<div class="ttt-cell {cls}">{symbol}</div>'
-    html += """
+    html += f"""
+        </div>
+        <svg class="ttt-overlay{overlay_class}" viewBox="0 0 360 360" preserveAspectRatio="none">
+          <line class="line-h0" x1="10" y1="60" x2="350" y2="60" />
+          <line class="line-h1" x1="10" y1="180" x2="350" y2="180" />
+          <line class="line-h2" x1="10" y1="300" x2="350" y2="300" />
+          <line class="line-v0" x1="60" y1="10" x2="60" y2="350" />
+          <line class="line-v1" x1="180" y1="10" x2="180" y2="350" />
+          <line class="line-v2" x1="300" y1="10" x2="300" y2="350" />
+          <line class="line-d0" x1="20" y1="20" x2="340" y2="340" />
+          <line class="line-d1" x1="340" y1="20" x2="20" y2="340" />
+        </svg>
       </div>
     </div>
     """
@@ -525,6 +627,7 @@ def execute_agent_move(agent_key: str) -> bool:
 
 def finish_game(winner_symbol: Optional[str]) -> None:
     starter = st.session_state.starting_player
+    current_game = st.session_state.game_number
     if winner_symbol == "Draw":
         winner = "Draw"
     elif winner_symbol == AGENTS["A"]["symbol"]:
@@ -533,6 +636,23 @@ def finish_game(winner_symbol: Optional[str]) -> None:
         winner = "B"
     else:
         winner = "Draw"
+
+    if winner in ("A", "B"):
+        st.session_state.winning_line = get_winning_line(st.session_state.board)
+    else:
+        st.session_state.winning_line = None
+    if winner == "Draw":
+        result_message = f"Game {current_game} ended in a draw."
+    else:
+        winner_name = AGENTS[winner]["name"]
+        winner_symbol_str = AGENTS[winner]["symbol"]
+        result_message = (
+            f"Game {current_game} won by {winner_name} ({winner_symbol_str})."
+        )
+
+    st.session_state.last_finished_board = st.session_state.board[:]
+    st.session_state.last_finished_line = st.session_state.winning_line
+    st.session_state.last_finished_game = current_game
 
     if winner == "A":
         st.session_state.tournament_points["A"] += 10
@@ -545,7 +665,7 @@ def finish_game(winner_symbol: Optional[str]) -> None:
 
     st.session_state.scoreboard.append(
         {
-            "game": st.session_state.game_number,
+            "game": current_game,
             "winner": winner,
             "starter": starter,
             "A_used_minimax": st.session_state.minimax_flags["A"],
@@ -558,7 +678,7 @@ def finish_game(winner_symbol: Optional[str]) -> None:
     )
     st.session_state.move_history.append(
         {
-            "game": st.session_state.game_number,
+            "game": current_game,
             "moves": [move.copy() for move in st.session_state.moves_this_game],
         }
     )
@@ -567,8 +687,11 @@ def finish_game(winner_symbol: Optional[str]) -> None:
 
     if st.session_state.game_number > MAX_GAMES:
         st.session_state.running = False
-        st.session_state.llm_status = "Series complete."
+        st.session_state.llm_status = f"{result_message} Series complete."
     else:
+        st.session_state.llm_status = (
+            f"{result_message} Next up: Game {st.session_state.game_number}."
+        )
         reset_board()
 
 
@@ -658,10 +781,9 @@ AGENTS["B"]["model"] = LLM_B_MODEL
 
 st.title(f"🤖 {LLM_A_LABEL} vs {LLM_B_LABEL} — Tic Tac Toe Series")
 st.caption(
-    "Before each game the agents decide whether to hand control to the perfect-play minimax helper "
-    "for the entire match—no mid-game bailouts. Press start to watch up to twenty-five games with rotating "
-    "openings. Defaults pit GPT-3.5-turbo against GPT-4o-mini; override via TICTAC_LLM_A_MODEL / "
-    "TICTAC_LLM_B_MODEL. "
+    "Before each showdown the agents decide whether to hand control to the perfect-play minimax helper "
+    "for the entire match—no mid-game bailouts. Press start to watch a five-game run. Defaults pit "
+    "GPT-3.5-turbo against GPT-4o-mini; override via TICTAC_LLM_A_MODEL / TICTAC_LLM_B_MODEL. "
     f"Current matchup — {LLM_A_LABEL} ({LLM_A_MODEL}) vs {LLM_B_LABEL} ({LLM_B_MODEL}). "
     "Tournament scoring: win = +10 pts, loss/draw = 0 pts, and each successive minimax use gets pricier "
     "(5, 10, 15… points, never refunded)."
@@ -688,7 +810,28 @@ st.subheader(
     f"Game {min(st.session_state.game_number, MAX_GAMES)} of {MAX_GAMES} "
     f"({'running' if st.session_state.running else 'idle'})"
 )
-render_board(st.session_state.board)
+board_cols = st.columns(2)
+with board_cols[0]:
+    st.caption("Live board")
+    render_board(st.session_state.board, st.session_state.get("winning_line"))
+with board_cols[1]:
+    if st.session_state.last_finished_board:
+        last_game_num = st.session_state.last_finished_game
+        title = (
+            f"Previous game (Game {last_game_num}) final board"
+            if last_game_num
+            else "Previous game final board"
+        )
+        st.caption(title)
+        render_board(
+            st.session_state.last_finished_board,
+            st.session_state.get("last_finished_line"),
+        )
+    else:
+        st.caption("Previous game board will appear here once a game finishes.")
+
+if st.session_state.get("opening_seed") is not None:
+    st.caption(f"Opening seed: {st.session_state.opening_seed}")
 
 st.write(st.session_state.llm_status or "Press start to begin the series.")
 
@@ -864,10 +1007,10 @@ with st.expander("How it works"):
         costs 5 points for the first use, 10 for the second, 15 for the third, and so on—fees are
         never refunded—while wins always grant +10 points and losses/draws pay 0. There are no
         mid-game requests, so the choice is locked at the opening move.
-        Press Start to watch up to twenty-five games with rotating openings. After each matchup the app
+        Press Start to watch five games with randomized opening seeds. After each matchup the app
         logs who won, whether minimax was used, token usage, and cumulative standings. If an LLM
         sends malformed JSON or repeats illegal moves we retry a few times; persistent problems
-        pause the series so you can intervene. When all games finish you'll see analytics covering
+        pause the series so you can intervene. When the series finishes you'll see analytics covering
         wins/losses/draws, point totals, and minimax reliance.
         """
     )
