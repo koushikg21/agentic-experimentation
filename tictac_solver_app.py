@@ -50,7 +50,7 @@ def minimax_fee_details(agent_key: str) -> Dict[str, int]:
     deficit = max(0, -score_gap)
     discount_steps = min(9, deficit // 10)
     adjustment = -discount_steps
-    dynamic_fee = max(1, min(5, base_fee + adjustment))
+    dynamic_fee = max(1, min(10, base_fee + adjustment))
     return {
         "fee": dynamic_fee,
         "base_fee": base_fee,
@@ -59,7 +59,7 @@ def minimax_fee_details(agent_key: str) -> Dict[str, int]:
         "agent_points": points_agent,
         "opponent_points": points_opponent,
     }
-MAX_GAMES = 5
+MAX_GAMES = 20
 MAX_LLM_RETRIES = 3
 OPENING_SEQUENCE = [0, 2, 6, 8, 4, 1, 3, 5, 7]
 
@@ -511,11 +511,11 @@ Current record: you {wins_agent} wins, opponent {wins_opponent} wins, {draws} dr
 Tournament points: you {points_agent}, opponent {points_opponent}.
 Series progress: Game {current_game} of {MAX_GAMES}; {games_remaining} game(s) remain including this one.
 
-Before this game starts you must decide if you want the perfect-play minimax engine to handle ALL of your moves.
-- Your next minimax attempt costs {next_fee} points (base {fee_info['base_fee']} with score-gap adjustment {adjustment_str} reflecting the current tournament gap: {gap_phrase}) and is never refunded, even if it pushes your score negative.
-- If you are currently ahead on tournament points, you are not allowed to choose minimax (tie or trailing only).
-- Wins always award +10 points (whether you used minimax or not); losses and draws award 0.
-- If you play manually you avoid the entry fee but still face the usual win/loss scoring.
+Your goal is to maximize your own net tournament points over the remaining games.
+- Wins award +10 points; losses/draws award 0.
+- Using minimax right now costs {next_fee} points (base {fee_info['base_fee']} with score-gap adjustment {adjustment_str} reflecting the current gap: {gap_phrase}) and the fee is never refunded.
+- You may only choose minimax if you are tied or trailing on points.
+- Do NOT choose minimax if paying the fee cannot increase your expected point total (e.g., if you are effectively paying 10+ points for a 10-point win).
 
 Return ONLY JSON:
 {{"use_minimax": true/false}}
@@ -844,7 +844,7 @@ st.title(f"🤖 {LLM_A_LABEL} vs {LLM_B_LABEL} — Tic Tac Toe Series")
 st.caption(
     "Before each showdown the agents decide whether to hand control to the perfect-play minimax helper "
     "for the entire match—no mid-game bailouts—and you can globally permit or disable that helper in the sidebar. "
-    "Press start to watch a five-game run. Defaults pit GPT-3.5-turbo against GPT-4o-mini; override via "
+    "Press start to watch a twenty-game run. Defaults pit GPT-3.5-turbo against GPT-4o-mini; override via "
     "TICTAC_LLM_A_MODEL / TICTAC_LLM_B_MODEL. "
     f"Current matchup — {LLM_A_LABEL} ({LLM_A_MODEL}) vs {LLM_B_LABEL} ({LLM_B_MODEL}). "
     "Tournament scoring: win = +10 pts, loss/draw = 0 pts, and minimax fees now stay between 1–10 points, "
@@ -1083,7 +1083,7 @@ with st.expander("How it works"):
         an increasingly cheap bailout. No entry fee is ever refunded.
         Fees are never refunded, wins always grant +10 points, and losses/draws pay 0. There are
         no mid-game requests, so the choice is locked at the opening move.
-        Press Start to watch five games with randomized opening seeds. After each matchup the app
+        Press Start to watch twenty games with randomized opening seeds. After each matchup the app
         logs who won, whether minimax was used, token usage, and cumulative standings. If an LLM
         sends malformed JSON or repeats illegal moves we retry a few times; persistent problems
         pause the series so you can intervene. When the series finishes you'll see analytics covering
