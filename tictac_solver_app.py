@@ -511,11 +511,11 @@ Current record: you {wins_agent} wins, opponent {wins_opponent} wins, {draws} dr
 Tournament points: you {points_agent}, opponent {points_opponent}.
 Series progress: Game {current_game} of {MAX_GAMES}; {games_remaining} game(s) remain including this one.
 
-Your goal is to maximize your own net tournament points over the remaining games.
-- Wins award +10 points; losses/draws award 0.
-- Using minimax right now costs {next_fee} points (base {fee_info['base_fee']} with score-gap adjustment {adjustment_str} reflecting the current gap: {gap_phrase}) and the fee is never refunded.
-- You may only choose minimax if you are tied or trailing on points.
-- Do NOT choose minimax if paying the fee cannot increase your expected point total (e.g., if you are effectively paying 10+ points for a 10-point win).
+Before this game starts you must decide if you want the perfect-play minimax engine to handle ALL of your moves.
+- Your next minimax attempt costs {next_fee} points (base {fee_info['base_fee']} with score-gap adjustment {adjustment_str} reflecting the current tournament gap: {gap_phrase}) and is never refunded, even if it pushes your score negative.
+- If you are currently ahead on tournament points, you are not allowed to choose minimax (tie or trailing only).
+- Wins always award +10 points (whether you used minimax or not); losses and draws award 0.
+- If you play manually you avoid the entry fee but still face the usual win/loss scoring.
 
 Return ONLY JSON:
 {{"use_minimax": true/false}}
