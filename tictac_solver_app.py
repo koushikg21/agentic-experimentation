@@ -1,12 +1,17 @@
+import csv
 import json
 import os
 import random
+import uuid
+from datetime import datetime
+from math import comb
 from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from openai import OpenAI
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -18,7 +23,8 @@ DEFAULT_LLM_A_MODEL = os.getenv("TICTAC_LLM_A_MODEL", "gpt-3.5-turbo")
 DEFAULT_LLM_B_MODEL = os.getenv("TICTAC_LLM_B_MODEL", "gpt-4o-mini")
 FALLBACK_MODEL_LIBRARY = [
     "gpt-4o-mini",
-    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4o-mini-2024-07-18",
     "gpt-3.5-turbo",
     "o4-mini",
 ]
@@ -59,8 +65,17 @@ def minimax_fee_details(agent_key: str) -> Dict[str, int]:
         "agent_points": points_agent,
         "opponent_points": points_opponent,
     }
-MAX_GAMES = 20
+DEFAULT_MAX_GAMES = 20
+GAME_LOG_FILE = "game_history.csv"
+CHEAP_MODEL_ALLOWLIST = {
+    "gpt-4o-mini",
+    "gpt-4o-mini-2024-07-18",
+    "gpt-4.1-mini",
+    "o4-mini",
+    "gpt-3.5-turbo",
+}
 MAX_LLM_RETRIES = 3
+MAX_GAME_RETRIES = 3
 OPENING_SEQUENCE = [0, 2, 6, 8, 4, 1, 3, 5, 7]
 
 WINNING_LINES = [
@@ -143,6 +158,21 @@ def minimax(
     return best_score, best_move
 
 
+def binomial_two_tailed_p(successes: int, trials: int, p: float = 0.5) -> float:
+    """Compute a two-tailed binomial p-value against a fairness null."""
+    if trials <= 0:
+        return 1.0
+    successes = max(0, min(trials, successes))
+    prob_success = comb(trials, successes) * (p**successes) * ((1 - p) ** (trials - successes))
+    threshold = prob_success + 1e-12
+    total = 0.0
+    for k in range(trials + 1):
+        prob = comb(trials, k) * (p**k) * ((1 - p) ** (trials - k))
+        if prob <= threshold:
+            total += prob
+    return min(1.0, total)
+
+
 def ensure_state() -> None:
     if "board" not in st.session_state:
         reset_board()
@@ -190,6 +220,20 @@ def ensure_state() -> None:
         st.session_state.minimax_fee_paid = {"A": 0, "B": 0}
     if "minimax_usage_count" not in st.session_state:
         st.session_state.minimax_usage_count = {"A": 0, "B": 0}
+    if "game_retry_count" not in st.session_state:
+        st.session_state.game_retry_count = 0
+    if "max_games" not in st.session_state:
+        st.session_state.max_games = DEFAULT_MAX_GAMES
+    if "game_incidents" not in st.session_state:
+        st.session_state.game_incidents: Dict[int, List[str]] = {}
+    if "series_id" not in st.session_state:
+        st.session_state.series_id = str(uuid.uuid4())
+    if "series_logged" not in st.session_state:
+        st.session_state.series_logged = False
+    if "human_agents" not in st.session_state:
+        st.session_state.human_agents = {"A": False, "B": False}
+    if "human_pending_move" not in st.session_state:
+        st.session_state.human_pending_move = {"A": None, "B": None}
     if "winning_line" not in st.session_state:
         st.session_state.winning_line = None
     if "last_finished_board" not in st.session_state:
@@ -211,6 +255,8 @@ def reset_board() -> None:
     st.session_state.pregame_decided = False
     st.session_state.minimax_fee_paid = {"A": 0, "B": 0}
     st.session_state.winning_line = None
+    for agent_key in ("A", "B"):
+        st.session_state.human_pending_move[agent_key] = None
 
 
 def reset_series() -> None:
@@ -227,6 +273,11 @@ def reset_series() -> None:
     st.session_state.last_finished_game = None
     refresh_opening_sequence()
     reset_board()
+    st.session_state.game_retry_count = 0
+    st.session_state.max_games = st.session_state.get("max_games", DEFAULT_MAX_GAMES)
+    st.session_state.game_incidents = {}
+    st.session_state.series_id = str(uuid.uuid4())
+    st.session_state.series_logged = False
 
 
 def refresh_opening_sequence(seed: Optional[int] = None) -> None:
@@ -241,7 +292,11 @@ def refresh_opening_sequence(seed: Optional[int] = None) -> None:
 
 def load_model_library() -> List[str]:
     def add_unique(items: List[str], model_id: Optional[str]) -> None:
-        if model_id and model_id not in items:
+        if (
+            model_id
+            and model_id not in items
+            and (model_id in CHEAP_MODEL_ALLOWLIST or model_id in (DEFAULT_LLM_A_MODEL, DEFAULT_LLM_B_MODEL))
+        ):
             items.append(model_id)
 
     models = FALLBACK_MODEL_LIBRARY[:]
@@ -254,16 +309,12 @@ def load_model_library() -> List[str]:
                 model_id = getattr(model, "id", None)
                 if not model_id:
                     continue
-                if not (
-                    model_id.startswith("gpt-")
-                    or model_id.startswith("o")
-                    or model_id.startswith("text-")
-                ):
+                if model_id not in CHEAP_MODEL_ALLOWLIST:
                     continue
                 add_unique(models, model_id)
         except Exception as exc:  # pragma: no cover - network call
             st.warning(f"Could not load OpenAI models dynamically: {exc}")
-    st.session_state.available_models = models
+    st.session_state.available_models = [m for m in models if m in CHEAP_MODEL_ALLOWLIST or m in (DEFAULT_LLM_A_MODEL, DEFAULT_LLM_B_MODEL)]
     return models
 
 
@@ -414,6 +465,53 @@ def log_move(agent_key: str, row: int, col: int, source: str) -> None:
     )
 
 
+def log_game_incident(game_number: int, message: str) -> None:
+    incidents = st.session_state.game_incidents.setdefault(game_number, [])
+    incidents.append(message)
+
+
+def append_series_log(scoreboard: List[Dict]) -> None:
+    if not scoreboard:
+        return
+    timestamp = datetime.utcnow().isoformat()
+    base = {
+        "timestamp": timestamp,
+        "series_id": st.session_state.get("series_id", ""),
+        "series_games_configured": st.session_state.get("max_games", DEFAULT_MAX_GAMES),
+        "A_model": AGENTS["A"]["model"],
+        "B_model": AGENTS["B"]["model"],
+    }
+    rows: List[Dict[str, Optional[str]]] = []
+    for entry in scoreboard:
+        row = base.copy()
+        row.update(
+            {
+                "game": entry.get("game"),
+                "winner": entry.get("winner"),
+                "starter": entry.get("starter"),
+                "moves": entry.get("move_count"),
+                "A_used_minimax": entry.get("A_used_minimax"),
+                "B_used_minimax": entry.get("B_used_minimax"),
+                "A_tokens": entry.get("A_tokens"),
+                "B_tokens": entry.get("B_tokens"),
+                "A_points": entry.get("A_points"),
+                "B_points": entry.get("B_points"),
+                "incidents": " | ".join(entry.get("incidents", []) or []),
+            }
+        )
+        rows.append(row)
+
+    file_exists = os.path.exists(GAME_LOG_FILE)
+    try:
+        with open(GAME_LOG_FILE, mode="a", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=list(rows[0].keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(rows)
+    except Exception as exc:
+        st.warning(f"Could not append tournament log to {GAME_LOG_FILE}: {exc}")
+
+
 def llm_pick_move(
     board: List[str],
     llm_symbol: str,
@@ -431,10 +529,32 @@ def llm_pick_move(
     if not client:
         return None, "Set OPENAI_API_KEY to let the LLM play.", 0
 
+    few_shots = """
+Q: X _ _
+   _ O _
+   _ _ _
+As X, best move?
+A: {"row": 1, "col": 3}
+
+Q: X O X
+   O X _
+   _ O _
+As X, best move?
+A: {"row": 3, "col": 3}
+
+Q: O _ _
+   _ X _
+   _ _ O
+As X, best move?
+A: {"row": 2, "col": 2}
+"""
     prompt = f"""
 You are {agent_label} playing Tic Tac Toe as {llm_symbol}. Your opponent uses {opponent_symbol}.
 
-Board rows (top to bottom) use _ for empty cells:
+Examples of perfect moves:
+{few_shots.strip()}
+
+Current board (rows use _ for empty cells):
 {board_text}
 
 Available moves (row, col): {available_moves}
@@ -453,7 +573,7 @@ Return ONLY JSON:
                 },
                 {"role": "user", "content": prompt},
             ],
-            temperature=0,
+            temperature=0.2,
         )
     except Exception as exc:  # pragma: no cover - network call
         return None, f"{agent_label} LLM error: {exc}", 0
@@ -503,17 +623,19 @@ def llm_decide_minimax(agent_key: str) -> Tuple[bool, str, int]:
     else:
         gap_phrase = "tied scoreboard"
     current_game = st.session_state.game_number
-    games_remaining = max(0, MAX_GAMES - current_game + 1)
+    max_games = st.session_state.get("max_games", DEFAULT_MAX_GAMES)
+    games_remaining = max(0, max_games - current_game + 1)
     prompt = f"""
 You are {agent['name']} preparing for Game {st.session_state.game_number}.
 
 Current record: you {wins_agent} wins, opponent {wins_opponent} wins, {draws} draws.
 Tournament points: you {points_agent}, opponent {points_opponent}.
-Series progress: Game {current_game} of {MAX_GAMES}; {games_remaining} game(s) remain including this one.
+Series progress: Game {current_game} of {max_games}; {games_remaining} game(s) remain including this one.
 
+Your goal is to maximize your net tournament points over the remaining games.
 Before this game starts you must decide if you want the perfect-play minimax engine to handle ALL of your moves.
 - Your next minimax attempt costs {next_fee} points (base {fee_info['base_fee']} with score-gap adjustment {adjustment_str} reflecting the current tournament gap: {gap_phrase}) and is never refunded, even if it pushes your score negative.
-- If you are currently ahead on tournament points, you are not allowed to choose minimax (tie or trailing only).
+- You may ONLY choose minimax if you are currently trailing on tournament points; ties and leaders must play manually.
 - Wins always award +10 points (whether you used minimax or not); losses and draws award 0.
 - If you play manually you avoid the entry fee but still face the usual win/loss scoring.
 
@@ -533,7 +655,7 @@ Return ONLY JSON:
                 },
                 {"role": "user", "content": prompt},
             ],
-            temperature=0,
+            temperature=0.2,
         )
     except Exception as exc:  # pragma: no cover - network call
         return False, f"{agent['name']} minimax decision error: {exc}", next_fee
@@ -576,11 +698,11 @@ def ensure_pregame_minimax_choices() -> None:
         points_agent = st.session_state.tournament_points.get(agent_key, 0)
         opponent_key = "B" if agent_key == "A" else "A"
         points_opponent = st.session_state.tournament_points.get(opponent_key, 0)
-        if points_agent > points_opponent:
+        if points_agent >= points_opponent:
             st.session_state.minimax_flags[agent_key] = False
             st.session_state.minimax_fee_paid[agent_key] = 0
             messages.append(
-                f"{AGENTS[agent_key]['name']} is leading on points, so minimax is disabled for this game."
+                f"{AGENTS[agent_key]['name']} is not trailing on points, so minimax is disabled for this game."
             )
             continue
         st.session_state.minimax_flags[agent_key] = use_minimax
@@ -611,10 +733,36 @@ def ensure_pregame_minimax_choices() -> None:
 
 
 def execute_agent_move(agent_key: str) -> bool:
+    if "human_pending_move" not in st.session_state:
+        st.session_state.human_pending_move = {"A": None, "B": None}
+    if "human_agents" not in st.session_state:
+        st.session_state.human_agents = {"A": False, "B": False}
     agent = AGENTS[agent_key]
     opponent_key = "B" if agent_key == "A" else "A"
     symbol = agent["symbol"]
     opponent_symbol = AGENTS[opponent_key]["symbol"]
+
+    if st.session_state.human_agents.get(agent_key):
+        pending_move = st.session_state.human_pending_move.get(agent_key)
+        if pending_move is None:
+            st.session_state.llm_status = (
+                f"{agent['name']} (human) to move — select a cell to continue."
+            )
+            return False
+        row, col = pending_move
+        idx = row * 3 + col
+        st.session_state.human_pending_move[agent_key] = None
+        if st.session_state.board[idx]:
+            st.session_state.llm_status = (
+                f"{agent['name']} selected an occupied square; please choose again."
+            )
+            return False
+        st.session_state.board[idx] = symbol
+        log_move(agent_key, row, col, "Human")
+        st.session_state.llm_status = (
+            f"{agent['name']} (human) played at row {row + 1}, col {col + 1}."
+        )
+        return True
 
     if st.session_state.minimax_flags.get(agent_key):
         _, move_idx = minimax(
@@ -658,14 +806,8 @@ def execute_agent_move(agent_key: str) -> bool:
         break
 
     if move is None:
-        st.session_state.llm_status = (
-            last_error
-            or f"{agent['name']} could not produce a legal move; stopping series."
-        )
-        st.session_state.llm_status += f" Game forfeited to {AGENTS[opponent_key]['name']}."
-        finish_game(AGENTS[opponent_key]["symbol"])
-        st.rerun()
-        return False
+        reason = last_error or "could not produce a legal move"
+        return restart_game_after_invalid_move(agent_key, opponent_key, reason)
 
     row, col = move
     idx = row * 3 + col
@@ -677,9 +819,55 @@ def execute_agent_move(agent_key: str) -> bool:
     return True
 
 
+def refund_current_minimax_fees() -> None:
+    for agent_key in ("A", "B"):
+        paid = st.session_state.minimax_fee_paid.get(agent_key, 0)
+        if paid:
+            st.session_state.tournament_points[agent_key] += paid
+            st.session_state.minimax_fee_paid[agent_key] = 0
+
+
+def restart_game_after_invalid_move(
+    agent_key: str, opponent_key: str, reason: str
+) -> bool:
+    retries = st.session_state.get("game_retry_count", 0)
+    if retries >= MAX_GAME_RETRIES:
+        st.session_state.llm_status = (
+            f"{AGENTS[agent_key]['name']} repeatedly produced invalid moves "
+            f"({reason}). Game forfeited to {AGENTS[opponent_key]['name']}."
+        )
+        log_game_incident(
+            st.session_state.game_number,
+            f"{AGENTS[agent_key]['name']} forfeited after invalid moves ({reason}).",
+        )
+        finish_game(AGENTS[opponent_key]["symbol"])
+        st.rerun()
+        return False
+
+    retries += 1
+    st.session_state.game_retry_count = retries
+    refund_current_minimax_fees()
+    log_game_incident(
+        st.session_state.game_number,
+        f"{AGENTS[agent_key]['name']} invalid move ({reason}); restart #{retries}.",
+    )
+    st.session_state.llm_status = (
+        f"{AGENTS[agent_key]['name']} produced an invalid move ({reason}). "
+        f"Restarting Game {st.session_state.game_number} "
+        f"(retry {retries}/{MAX_GAME_RETRIES})."
+    )
+    reset_board()
+    st.session_state.pregame_decided = False
+    st.session_state.opening_move_done = False
+    st.session_state.running = True
+    st.rerun()
+    return False
+
+
 def finish_game(winner_symbol: Optional[str]) -> None:
     starter = st.session_state.starting_player
     current_game = st.session_state.game_number
+    st.session_state.game_retry_count = 0
     if winner_symbol == "Draw":
         winner = "Draw"
     elif winner_symbol == AGENTS["A"]["symbol"]:
@@ -711,24 +899,26 @@ def finish_game(winner_symbol: Optional[str]) -> None:
     elif winner == "B":
         st.session_state.tournament_points["B"] += 10
 
+    incidents = st.session_state.game_incidents.pop(current_game, [])
+
     for agent_key in ("A", "B"):
         if st.session_state.minimax_fee_paid.get(agent_key):
             st.session_state.minimax_fee_paid[agent_key] = 0
 
-    st.session_state.scoreboard.append(
-        {
-            "game": current_game,
-            "winner": winner,
-            "starter": starter,
-            "move_count": len(st.session_state.moves_this_game),
-            "A_used_minimax": st.session_state.minimax_flags["A"],
-            "B_used_minimax": st.session_state.minimax_flags["B"],
-            "A_tokens": st.session_state.current_tokens["A"],
-            "B_tokens": st.session_state.current_tokens["B"],
-            "A_points": st.session_state.tournament_points["A"],
-            "B_points": st.session_state.tournament_points["B"],
-        }
-    )
+    entry = {
+        "game": current_game,
+        "winner": winner,
+        "starter": starter,
+        "move_count": len(st.session_state.moves_this_game),
+        "A_used_minimax": st.session_state.minimax_flags["A"],
+        "B_used_minimax": st.session_state.minimax_flags["B"],
+        "A_tokens": st.session_state.current_tokens["A"],
+        "B_tokens": st.session_state.current_tokens["B"],
+        "A_points": st.session_state.tournament_points["A"],
+        "B_points": st.session_state.tournament_points["B"],
+        "incidents": incidents,
+    }
+    st.session_state.scoreboard.append(entry)
     st.session_state.move_history.append(
         {
             "game": current_game,
@@ -738,9 +928,13 @@ def finish_game(winner_symbol: Optional[str]) -> None:
     st.session_state.game_number += 1
     st.session_state.starting_player = "B" if st.session_state.starting_player == "A" else "A"
 
-    if st.session_state.game_number > MAX_GAMES:
+    max_games = st.session_state.get("max_games", DEFAULT_MAX_GAMES)
+    if st.session_state.game_number > max_games:
         st.session_state.running = False
         st.session_state.llm_status = f"{result_message} Series complete."
+        if not st.session_state.get("series_logged"):
+            append_series_log(st.session_state.scoreboard)
+            st.session_state.series_logged = True
     else:
         st.session_state.llm_status = (
             f"{result_message} Next up: Game {st.session_state.game_number}."
@@ -751,7 +945,8 @@ def finish_game(winner_symbol: Optional[str]) -> None:
 def maybe_run_series() -> None:
     if not st.session_state.running:
         return
-    if st.session_state.game_number > MAX_GAMES:
+    max_games = st.session_state.get("max_games", DEFAULT_MAX_GAMES)
+    if st.session_state.game_number > max_games:
         st.session_state.running = False
         return
 
@@ -830,6 +1025,28 @@ with st.sidebar:
             "Fees stay between 1 and 10 points and drop as the current tournament deficit grows."
         ),
     )
+    series_options = [5, 10, 20, 30, 50, 100]
+    current_max = st.session_state.get("max_games", DEFAULT_MAX_GAMES)
+    if current_max not in series_options:
+        series_options.append(current_max)
+        series_options = sorted(series_options)
+    selected_series_length = st.selectbox(
+        "Games per series",
+        series_options,
+        index=series_options.index(current_max),
+        help="Choose how many games to run before the series auto-stops.",
+    )
+    st.session_state.max_games = selected_series_length
+    st.session_state.human_agents["A"] = st.checkbox(
+        "Play X manually",
+        value=st.session_state.human_agents["A"],
+        help="When enabled, you will choose moves for the X player.",
+    )
+    st.session_state.human_agents["B"] = st.checkbox(
+        "Play O manually",
+        value=st.session_state.human_agents["B"],
+        help="When enabled, you will choose moves for the O player.",
+    )
 
 LLM_A_MODEL = st.session_state.model_a_choice
 LLM_B_MODEL = st.session_state.model_b_choice
@@ -842,13 +1059,9 @@ AGENTS["B"]["model"] = LLM_B_MODEL
 
 st.title(f"🤖 {LLM_A_LABEL} vs {LLM_B_LABEL} — Tic Tac Toe Series")
 st.caption(
-    "Before each showdown the agents decide whether to hand control to the perfect-play minimax helper "
-    "for the entire match—no mid-game bailouts—and you can globally permit or disable that helper in the sidebar. "
-    "Press start to watch a twenty-game run. Defaults pit GPT-3.5-turbo against GPT-4o-mini; override via "
-    "TICTAC_LLM_A_MODEL / TICTAC_LLM_B_MODEL. "
-    f"Current matchup — {LLM_A_LABEL} ({LLM_A_MODEL}) vs {LLM_B_LABEL} ({LLM_B_MODEL}). "
-    "Tournament scoring: win = +10 pts, loss/draw = 0 pts, and minimax fees now stay between 1–10 points, "
-    "starting at 10 while tied or leading and dropping by 1 for each 10-point deficit."
+    "Agents lock in their minimax choice before each game—no mid-match bailouts—and you can toggle that helper in the sidebar. "
+    "Run a series (default 20 games, adjustable in the sidebar) featuring GPT-3.5 vs GPT-4o-mini by default (override via TICTAC_LLM_* env vars). "
+    "Wins pay +10 points, draws/losses pay 0, and minimax entry fees stay between 1–10 points based on the score gap."
 )
 
 col_controls = st.columns([1, 1, 1])
@@ -868,13 +1081,14 @@ with col_controls[2]:
         reset_series()
         st.rerun()
 
+current_max_games = st.session_state.get("max_games", DEFAULT_MAX_GAMES)
 st.subheader(
-    f"Game {min(st.session_state.game_number, MAX_GAMES)} of {MAX_GAMES} "
+    f"Game {min(st.session_state.game_number, current_max_games)} of {current_max_games} "
     f"({'running' if st.session_state.running else 'idle'})"
 )
 board_cols = st.columns(2)
 with board_cols[0]:
-    st.caption("Live board")
+    st.caption("Live board (current game)")
     render_board(st.session_state.board, st.session_state.get("winning_line"))
 with board_cols[1]:
     if st.session_state.last_finished_board:
@@ -908,7 +1122,42 @@ if st.session_state.allow_minimax:
 else:
     st.caption("Minimax helper disabled — every move will be LLM-driven without perfect-play overrides.")
 
-st.subheader("Scoreboard")
+current_player = st.session_state.current_player
+if "human_pending_move" not in st.session_state:
+    st.session_state.human_pending_move = {"A": None, "B": None}
+if "human_agents" not in st.session_state:
+    st.session_state.human_agents = {"A": False, "B": False}
+if st.session_state.human_agents.get(current_player):
+    player_name = AGENTS[current_player]["name"]
+    st.markdown(f"**Human move controls — {player_name} ({AGENTS[current_player]['symbol']})**")
+    if st.session_state.running:
+        available = [idx for idx, cell in enumerate(st.session_state.board) if not cell]
+        if available:
+            labels = [
+                f"Cell {idx + 1} (row {idx // 3 + 1}, col {idx % 3 + 1})"
+                for idx in available
+            ]
+            select_key = f"human_move_choice_{current_player}_{st.session_state.game_number}"
+            selection = st.selectbox(
+                "Choose your move",
+                list(range(len(available))),
+                format_func=lambda i: labels[i],
+                key=select_key,
+            )
+            if st.button(f"Play move as {player_name}"):
+                move_idx = available[selection]
+                row, col = divmod(move_idx, 3)
+                st.session_state.human_pending_move[current_player] = (row, col)
+                st.session_state.llm_status = (
+                    f"{player_name} queued move at row {row + 1}, col {col + 1}."
+                )
+                st.rerun()
+        else:
+            st.info("Board is full. Waiting for the game to resolve.")
+    else:
+        st.info("Start or resume the series to submit a manual move.")
+
+st.subheader("Live scoreboard")
 scoreboard_entries = st.session_state.scoreboard
 agent_name_a = AGENTS["A"]["name"]
 agent_name_b = AGENTS["B"]["name"]
@@ -917,59 +1166,106 @@ display_name_b = agent_name_b
 if display_name_a == display_name_b:
     display_name_a = f"{display_name_a} (X)"
     display_name_b = f"{display_name_b} (O)"
+
 if scoreboard_entries:
     wins_a = sum(1 for e in scoreboard_entries if e["winner"] == "A")
     wins_b = sum(1 for e in scoreboard_entries if e["winner"] == "B")
     draws = sum(1 for e in scoreboard_entries if e["winner"] == "Draw")
-    st.table(
-        [
-            {
-                "Game": entry["game"],
-                "Winner": (
-                    "Draw"
-                    if entry["winner"] == "Draw"
-                    else AGENTS[entry["winner"]]["symbol"]
-                ),
-                "Starter": (
-                    f"{AGENTS[entry['starter']]['name']} ({AGENTS[entry['starter']]['symbol']})"
-                    if entry.get("starter") in AGENTS
-                    else entry.get("starter", "?")
-                ),
-                "Moves to Finish": entry.get("move_count", 0),
-                f"{display_name_a} Minimax?": "Yes" if entry["A_used_minimax"] else "No",
-                f"{display_name_b} Minimax?": "Yes" if entry["B_used_minimax"] else "No",
-                f"{display_name_a} Tokens": entry.get("A_tokens", 0),
-                f"{display_name_b} Tokens": entry.get("B_tokens", 0),
-                f"{display_name_a} Points": entry.get("A_points", 0),
-                f"{display_name_b} Points": entry.get("B_points", 0),
-            }
-            for entry in scoreboard_entries
-        ]
-    )
-    score_cols = st.columns(2)
-    with score_cols[0]:
-        st.metric(f"{display_name_a} wins", wins_a)
-    with score_cols[1]:
-        st.metric(f"{display_name_b} wins", wins_b)
-    st.caption(
-        f"Series tally — {display_name_a}: {wins_a} wins, "
-        f"{display_name_b}: {wins_b} wins, Draws: {draws}."
-    )
-    st.caption(
-        f"Cumulative score — {display_name_a}: {st.session_state.tournament_points['A']} pts, "
-        f"{display_name_b}: {st.session_state.tournament_points['B']} pts."
-    )
+
+    def _summary_tile(label: str, value: str, color: str = "#555") -> None:
+        st.markdown(
+            f"""
+            <div style="text-align:center;padding:0.5rem 0;">
+                <div style="font-size:0.9rem;color:#666;">{label}</div>
+                <div style="font-size:2rem;font-weight:700;color:{color};">{value}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    color_a = "#2ecc71"
+    color_b = "#e74c3c"
+    if wins_a == wins_b:
+        color_a = color_b = "#3498db"
+
+    summary_cols = st.columns(4)
+    with summary_cols[0]:
+        _summary_tile("Games played", len(scoreboard_entries))
+    with summary_cols[1]:
+        _summary_tile(f"{display_name_a} wins", wins_a, color=color_a)
+    with summary_cols[2]:
+        _summary_tile(f"{display_name_b} wins", wins_b, color=color_b)
+    with summary_cols[3]:
+        _summary_tile("Draws", draws)
+    score_progress_cols = st.columns(2)
+    with score_progress_cols[0]:
+        st.progress(min(1.0, st.session_state.tournament_points["A"] / 200))
+        st.caption(
+            f"{display_name_a} score: {st.session_state.tournament_points['A']} pts"
+        )
+    with score_progress_cols[1]:
+        st.progress(min(1.0, st.session_state.tournament_points["B"] / 200))
+        st.caption(
+            f"{display_name_b} score: {st.session_state.tournament_points['B']} pts"
+        )
 else:
     st.caption("No games completed yet.")
-    st.caption(
-        f"Current score — {display_name_a}: {st.session_state.tournament_points['A']} pts, "
-        f"{display_name_b}: {st.session_state.tournament_points['B']} pts."
-    )
+
+with st.expander("Game-level details", expanded=True):
+    if scoreboard_entries:
+        helper_status = (
+            "disabled — all moves are LLM-driven."
+            if not st.session_state.allow_minimax
+            else "enabled — agents may pre-pay to delegate a game."
+        )
+        opening_seed = st.session_state.get("opening_seed")
+        st.caption(f"Minimax helper is {helper_status}")
+        if opening_seed is not None:
+            st.caption(f"Opening sequence seed: {opening_seed}")
+        if st.session_state.llm_status:
+            st.caption(f"Game commentary: {st.session_state.llm_status}")
+
+        table_rows = []
+        for entry in scoreboard_entries:
+            winner_cell = "Draw"
+            if entry["winner"] != "Draw" and entry["winner"] in AGENTS:
+                winner_agent = AGENTS[entry["winner"]]
+                winner_cell = (
+                    f"{winner_agent['name']} ({winner_agent['model']}) "
+                    f"[{winner_agent['symbol']}]"
+                )
+            starter_cell = (
+                f"{AGENTS[entry['starter']]['name']} ({AGENTS[entry['starter']]['symbol']})"
+                if entry.get("starter") in AGENTS
+                else entry.get("starter", "?")
+            )
+            incidents_list = entry.get("incidents", [])
+            incidents_cell = " / ".join(incidents_list) if incidents_list else "—"
+            table_rows.append(
+                {
+                    "Game": entry["game"],
+                    "Winner": winner_cell,
+                    "Starter": starter_cell,
+                    "Moves to Finish": entry.get("move_count", 0),
+                    f"{display_name_a} Minimax?": "Yes" if entry["A_used_minimax"] else "No",
+                    f"{display_name_b} Minimax?": "Yes" if entry["B_used_minimax"] else "No",
+                    f"{display_name_a} Tokens": entry.get("A_tokens", 0),
+                    f"{display_name_b} Tokens": entry.get("B_tokens", 0),
+                    f"{display_name_a} Points": entry.get("A_points", 0),
+                    f"{display_name_b} Points": entry.get("B_points", 0),
+                    "Incidents": incidents_cell,
+                }
+            )
+
+        table_df = pd.DataFrame(table_rows)
+        st.dataframe(table_df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No game-level details available yet.")
 
 if (
     scoreboard_entries
     and not st.session_state.running
-    and st.session_state.game_number > MAX_GAMES
+    and st.session_state.game_number > st.session_state.get("max_games", DEFAULT_MAX_GAMES)
 ):
     total_games = len(scoreboard_entries)
     minimax_wins_a = sum(
@@ -1002,56 +1298,183 @@ if (
 
     losses_a = wins_b
     losses_b = wins_a
-    col_plot_a, col_plot_b = st.columns(2)
-    with col_plot_a:
-        st.caption(f"{display_name_a} ({LLM_A_MODEL}) outcomes")
-        results_a_df = pd.DataFrame(
+
+    non_draw_games = total_games - draws
+    if non_draw_games > 0:
+        if wins_a > wins_b:
+            leading_agent = display_name_a
+            leading_model = LLM_A_MODEL
+            successes_for_test = wins_a
+            success_axis_label = f"{display_name_a} wins (non-draw games)"
+        elif wins_b > wins_a:
+            leading_agent = display_name_b
+            leading_model = LLM_B_MODEL
+            successes_for_test = wins_b
+            success_axis_label = f"{display_name_b} wins (non-draw games)"
+        else:
+            leading_agent = None
+            leading_model = None
+            successes_for_test = wins_a
+            success_axis_label = "Wins (non-draw games)"
+
+        p_value = binomial_two_tailed_p(successes_for_test, non_draw_games)
+        significance_cols = st.columns(2)
+        with significance_cols[0]:
+            st.metric(
+                "Non-draw games",
+                non_draw_games,
+                help="Used to evaluate statistical significance of the win split.",
+            )
+        with significance_cols[1]:
+            st.metric("Win-rate p-value", f"{p_value:.3f}")
+
+        if leading_agent:
+            msg = (
+                f"{leading_agent} ({leading_model}) lead is statistically significant (p={p_value:.3f})"
+                if p_value < 0.05
+                else f"No statistical significance yet—need more games to confirm {leading_agent}'s edge (p={p_value:.3f})."
+            )
+        else:
+            msg = (
+                f"Series currently tied with {non_draw_games} decisive games "
+                f"(p={p_value:.3f}); no significance."
+            )
+
+        announce = st.success if leading_agent and p_value < 0.05 else st.info
+        announce(msg)
+
+        distribution_df = pd.DataFrame(
             {
-                "Outcome": ["Wins", "Losses", "Draws"],
-                "Count": [wins_a, losses_a, draws],
+                "Win_count": list(range(non_draw_games + 1)),
+                "Probability": [
+                    comb(non_draw_games, k) * (0.5 ** non_draw_games) for k in range(non_draw_games + 1)
+                ],
             }
         )
-        fig_a = px.bar(
-            results_a_df,
-            x="Outcome",
-            y="Count",
-            color="Outcome",
-            text="Count",
-            title=f"{display_name_a} results",
-            color_discrete_sequence=px.colors.qualitative.Set2,
+        distribution_df["Observed"] = distribution_df["Win_count"] == successes_for_test
+        fig_dist = px.bar(
+            distribution_df,
+            x="Win_count",
+            y="Probability",
+            color="Observed",
+            color_discrete_map={True: "#2ecc71", False: "#95a5a6"},
+            labels={"Win_count": success_axis_label},
+            title="Binomial distribution under a fair matchup (p=0.5)",
         )
-        fig_a.update_layout(showlegend=False)
-        st.plotly_chart(fig_a, use_container_width=True)
+        fig_dist.update_layout(showlegend=False)
+        st.plotly_chart(fig_dist, use_container_width=True)
 
-    with col_plot_b:
-        st.caption(f"{display_name_b} ({LLM_B_MODEL}) outcomes")
-        results_b_df = pd.DataFrame(
+    minimax_long = []
+    for agent_name, usage, wins_via_minimax in (
+        (display_name_a, minimax_usage_a, minimax_wins_a),
+        (display_name_b, minimax_usage_b, minimax_wins_b),
+    ):
+        minimax_long.append(
             {
-                "Outcome": ["Wins", "Losses", "Draws"],
-                "Count": [wins_b, losses_b, draws],
+                "Agent": agent_name,
+                "Metric": "Games using minimax",
+                "Value": usage,
             }
         )
-        fig_b = px.bar(
-            results_b_df,
-            x="Outcome",
-            y="Count",
-            color="Outcome",
-            text="Count",
-            title=f"{display_name_b} results",
-            color_discrete_sequence=px.colors.qualitative.Set2,
+        minimax_long.append(
+            {
+                "Agent": agent_name,
+                "Metric": "Wins needing minimax",
+                "Value": wins_via_minimax,
+            }
         )
-        fig_b.update_layout(showlegend=False)
-        st.plotly_chart(fig_b, use_container_width=True)
-
-    minimax_df = pd.DataFrame(
-        {
-            "Agent": [display_name_a, display_name_b],
-            "Minimax Used (games)": [minimax_usage_a, minimax_usage_b],
-            "Wins needing Minimax": [minimax_wins_a, minimax_wins_b],
-        }
-    ).set_index("Agent")
+    minimax_df = pd.DataFrame(minimax_long)
     st.caption("Minimax reliance")
-    st.bar_chart(minimax_df, use_container_width=True)
+    fig_minimax = px.bar_polar(
+        minimax_df,
+        r="Value",
+        theta="Metric",
+        color="Agent",
+        color_discrete_sequence=px.colors.qualitative.Pastel2,
+        title="How often each agent leaned on minimax",
+    )
+    fig_minimax.update_traces(opacity=0.85)
+    st.plotly_chart(fig_minimax, use_container_width=True)
+
+    cumulative_wins = []
+    minimax_marker_map: Dict[int, List[Dict[str, float]]] = {}
+    a_total = 0
+    b_total = 0
+    for entry in scoreboard_entries:
+        if entry["winner"] == "A":
+            a_total += 1
+        elif entry["winner"] == "B":
+            b_total += 1
+        cumulative_wins.append(
+            {
+                "Game": entry["game"],
+                "Agent": display_name_a,
+                "Wins": a_total,
+                "Used minimax": entry["A_used_minimax"],
+            }
+        )
+        cumulative_wins.append(
+            {
+                "Game": entry["game"],
+                "Agent": display_name_b,
+                "Wins": b_total,
+                "Used minimax": entry["B_used_minimax"],
+            }
+        )
+        if entry["A_used_minimax"]:
+            minimax_marker_map.setdefault(entry["game"], []).append(
+                {"Agent": display_name_a, "Wins": a_total}
+            )
+        if entry["B_used_minimax"]:
+            minimax_marker_map.setdefault(entry["game"], []).append(
+                {"Agent": display_name_b, "Wins": b_total}
+            )
+    animation_df = pd.DataFrame(cumulative_wins)
+    st.caption("Cumulative wins over time")
+    fig_animation = px.bar(
+        animation_df,
+        x="Wins",
+        y="Agent",
+        color="Agent",
+        orientation="h",
+        animation_frame="Game",
+        animation_group="Agent",
+        range_x=[0, max(wins_a, wins_b, 1)],
+        color_discrete_sequence=px.colors.qualitative.Set1,
+        title="Game-by-game win counter (minimax flag in tooltip)",
+    )
+    fig_animation.update_layout(transition={"duration": 600})
+    marker_style = dict(symbol="line-ns-open", size=26, color="#f39c12", line=dict(width=4))
+    initial_game = (
+        animation_df["Game"].min() if not animation_df.empty else None
+    )
+    initial_markers = minimax_marker_map.get(initial_game or 0, [])
+    marker_trace = go.Scatter(
+        x=[m["Wins"] for m in initial_markers],
+        y=[m["Agent"] for m in initial_markers],
+        mode="markers",
+        marker=marker_style,
+        name="Minimax marker",
+        hoverinfo="skip",
+        showlegend=False,
+    )
+    fig_animation.add_trace(marker_trace)
+    for frame in fig_animation.frames:
+        game_id = int(frame.name)
+        markers = minimax_marker_map.get(game_id, [])
+        frame_data = list(frame.data)
+        frame_data.append(
+            go.Scatter(
+                x=[m["Wins"] for m in markers],
+                y=[m["Agent"] for m in markers],
+                mode="markers",
+                marker=marker_style,
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+        frame.data = tuple(frame_data)
+    st.plotly_chart(fig_animation, use_container_width=True)
 
 st.subheader("Move history")
 if st.session_state.move_history:
