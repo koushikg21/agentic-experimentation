@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tic-Tac Toe Series Dashboard</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <div class="dashboard">
+        <header>
+            <div class="title-group">
+                <p class="eyebrow">tic-tac showdown</p>
+                <h1>Series Insight</h1>
+                <p class="subtitle">Animated view of the most recent tic-tac-toe marathon logged in <code>game_history.csv</code>.</p>
+            </div>
+            <div class="controls">
+                <div class="meta">
+                    <span id="series-label">Series —</span>
+                    <span id="model-label">Models —</span>
+                </div>
+            </div>
+        </header>
+
+        <main>
+            <section class="card chart-card">
+                <div class="card-header">
+                    <div class="card-header-text">
+                        <h2>Series progression</h2>
+                        <p>Toggle between cumulative wins or score to see how momentum shifted each round.</p>
+                    </div>
+                    <div class="metric-toggle" role="group" aria-label="Metric selector">
+                        <button class="active" data-metric="wins">Wins</button>
+                        <button data-metric="points">Score</button>
+                    </div>
+                    <button id="start-btn" class="primary">Start animation</button>
+                </div>
+                <div class="chart-visuals">
+                    <svg id="score-chart" viewBox="0 0 1020 420" role="img" aria-label="Series progression chart"></svg>
+                    <p id="status" class="status">Loading...</p>
+                    <p id="legend-text" class="legend-text" aria-live="polite"></p>
+                </div>
+                <div id="final-summary" class="final-summary hidden" aria-live="polite"></div>
+            </section>
+
+            <section class="card timeline-card">
+                <div class="card-header">
+                    <div class="card-header-text">
+                        <h2>Minimax timeline</h2>
+                        <p>Each tile highlights when Player A or B invoked minimax.</p>
+                    </div>
+                </div>
+                <div id="timeline" class="timeline"></div>
+            </section>
+        </main>
+
+        <footer>
+            <p>Serve the repo root (e.g. <code>python -m http.server</code>) and visit <code>/web_frontend/</code> so the browser can reach <code>../game_history.csv</code>.</p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

@@ -533,26 +533,51 @@ def llm_pick_move(
 Q: X _ _
    _ O _
    _ _ _
-As X, best move?
+As X, best move? (Win is possible on row 1; take it.)
 A: {"row": 1, "col": 3}
 
 Q: X O X
    O X _
    _ O _
-As X, best move?
+As X, best move? (Block opponent's win on column 3.)
 A: {"row": 3, "col": 3}
 
 Q: O _ _
    _ X _
    _ _ O
-As X, best move?
+As X, best move? (Take center to create fork threats.)
 A: {"row": 2, "col": 2}
+
+Q: X _ _
+   _ _ _
+   _ _ _
+As X, best move? (Open with the center when available.)
+A: {"row": 2, "col": 2}
+
+Q: O X _
+   _ _ _
+   _ _ X
+As O, best move? (Block X's diagonal fork by playing row 2 col 2.)
+A: {"row": 2, "col": 2}
+
+Q: X O X
+   O X O
+   _ _ _
+As X, best move? (Take a corner to threaten the final row.)
+A: {"row": 3, "col": 1}
 """
     prompt = f"""
 You are {agent_label} playing Tic Tac Toe as {llm_symbol}. Your opponent uses {opponent_symbol}.
 
 Examples of perfect moves:
 {few_shots.strip()}
+
+Guidelines:
+- If you can win immediately, do it.
+- Otherwise, block any immediate opponent win.
+- Otherwise, take the center if open.
+- Otherwise, take a corner (1,1 / 1,3 / 3,1 / 3,3).
+- Otherwise, play any remaining edge square.
 
 Current board (rows use _ for empty cells):
 {board_text}
@@ -573,7 +598,7 @@ Return ONLY JSON:
                 },
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.2,
+            temperature=0.1,
         )
     except Exception as exc:  # pragma: no cover - network call
         return None, f"{agent_label} LLM error: {exc}", 0
@@ -626,18 +651,17 @@ def llm_decide_minimax(agent_key: str) -> Tuple[bool, str, int]:
     max_games = st.session_state.get("max_games", DEFAULT_MAX_GAMES)
     games_remaining = max(0, max_games - current_game + 1)
     prompt = f"""
-You are {agent['name']} preparing for Game {st.session_state.game_number}.
+You are {agent['name']} deciding Game {st.session_state.game_number}.
 
-Current record: you {wins_agent} wins, opponent {wins_opponent} wins, {draws} draws.
-Tournament points: you {points_agent}, opponent {points_opponent}.
-Series progress: Game {current_game} of {max_games}; {games_remaining} game(s) remain including this one.
+Scoreboard: you {wins_agent}W/{points_agent}pts, opponent {wins_opponent}W/{points_opponent}pts, draws {draws}.
+Series: {current_game}/{max_games} (games left including this one: {games_remaining}). Current gap: {gap_phrase}.
 
-Your goal is to maximize your net tournament points over the remaining games.
-Before this game starts you must decide if you want the perfect-play minimax engine to handle ALL of your moves.
-- Your next minimax attempt costs {next_fee} points (base {fee_info['base_fee']} with score-gap adjustment {adjustment_str} reflecting the current tournament gap: {gap_phrase}) and is never refunded, even if it pushes your score negative.
-- You may ONLY choose minimax if you are currently trailing on tournament points; ties and leaders must play manually.
-- Wins always award +10 points (whether you used minimax or not); losses and draws award 0.
-- If you play manually you avoid the entry fee but still face the usual win/loss scoring.
+Choosing minimax hands the whole game to a perfect helper.
+- Entry fee this game: {next_fee} points (base {fee_info['base_fee']} + adjustment {adjustment_str}). Fee is never refunded.
+- Manual win = +10 points. Minimax win = +{10 - next_fee} (because of the fee). Losses/draws = 0.
+- You may choose minimax ONLY while trailing in tournament points.
+
+Decide if the guaranteed win is worth the fee: use minimax when you urgently need certainty; otherwise keep the full 10-point upside by playing yourself.
 
 Return ONLY JSON:
 {{"use_minimax": true/false}}
