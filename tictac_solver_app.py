@@ -76,7 +76,6 @@ CHEAP_MODEL_ALLOWLIST = {
 }
 MAX_LLM_RETRIES = 3
 MAX_GAME_RETRIES = 3
-OPENING_SEQUENCE = [0, 2, 6, 8, 4, 1, 3, 5, 7]
 
 WINNING_LINES = [
     (0, 1, 2),
@@ -509,7 +508,38 @@ def append_series_log(scoreboard: List[Dict]) -> None:
                 writer.writeheader()
             writer.writerows(rows)
     except Exception as exc:
-        st.warning(f"Could not append tournament log to {GAME_LOG_FILE}: {exc}")
+            st.warning(f"Could not append tournament log to {GAME_LOG_FILE}: {exc}")
+
+
+def recent_games_context(limit: int = 5) -> str:
+    history = st.session_state.move_history[-limit:]
+    if not history:
+        return "None — no completed games yet."
+
+    scoreboard_by_game = {entry["game"]: entry for entry in st.session_state.scoreboard}
+    sections: List[str] = []
+    for game in history:
+        game_id = game.get("game")
+        entry = scoreboard_by_game.get(game_id, {})
+        winner_code = entry.get("winner", "Draw")
+        if winner_code in ("A", "B"):
+            agent = AGENTS[winner_code]
+            result_desc = f"{agent['name']} ({agent['symbol']}) won"
+        elif winner_code == "Draw":
+            result_desc = "Draw"
+        else:
+            result_desc = str(winner_code or "Unknown result")
+
+        moves = []
+        for idx, move in enumerate(game.get("moves", []), start=1):
+            moves.append(
+                f"{idx}. {move.get('symbol', '?')} -> r{move.get('row', '?')}c{move.get('col', '?')} ({move.get('source', 'Unknown')})"
+            )
+        move_text = "\n   ".join(moves) if moves else "   (no moves recorded)"
+        sections.append(
+            f"Game {game_id}: {result_desc}\n   {move_text}"
+        )
+    return "\n\n".join(sections)
 
 
 def llm_pick_move(
@@ -526,6 +556,7 @@ def llm_pick_move(
     available_moves = [
         (idx // 3 + 1, idx % 3 + 1) for idx, cell in enumerate(board) if not cell
     ]
+    history_digest = recent_games_context()
     if not client:
         return None, "Set OPENAI_API_KEY to let the LLM play.", 0
 
@@ -578,9 +609,13 @@ Guidelines:
 - Otherwise, take the center if open.
 - Otherwise, take a corner (1,1 / 1,3 / 3,1 / 3,3).
 - Otherwise, play any remaining edge square.
+- Learn from how the last few games ended — adapt if repeated losses or draws keep occurring.
 
 Current board (rows use _ for empty cells):
 {board_text}
+
+Recent games (oldest to newest, up to 5):
+{history_digest}
 
 Available moves (row, col): {available_moves}
 
@@ -979,11 +1014,6 @@ def maybe_run_series() -> None:
         if not st.session_state.running:
             return
 
-    if not st.session_state.opening_move_done:
-        seed_opening_move()
-        st.rerun()
-        return
-
     winner = check_winner(st.session_state.board)
     if winner:
         finish_game(winner)
@@ -1110,7 +1140,7 @@ st.subheader(
     f"Game {min(st.session_state.game_number, current_max_games)} of {current_max_games} "
     f"({'running' if st.session_state.running else 'idle'})"
 )
-board_cols = st.columns(2)
+board_cols = st.columns([1, 1, 1])
 with board_cols[0]:
     st.caption("Live board (current game)")
     render_board(st.session_state.board, st.session_state.get("winning_line"))
@@ -1129,9 +1159,26 @@ with board_cols[1]:
         )
     else:
         st.caption("Previous game board will appear here once a game finishes.")
-
-if st.session_state.get("opening_seed") is not None:
-    st.caption(f"Opening seed: {st.session_state.opening_seed}")
+with board_cols[2]:
+    st.caption("Recent move history")
+    if st.session_state.move_history:
+        recent_games = list(reversed(st.session_state.move_history[-2:]))
+        for game_record in recent_games:
+            st.markdown(f"**Game {game_record['game']}**")
+            st.table(
+                [
+                    {
+                        "Agent": AGENTS.get(move["agent"], {}).get("name", move["agent"]),
+                        "Symbol": move["symbol"],
+                        "Row": move["row"],
+                        "Col": move["col"],
+                        "Source": move["source"],
+                    }
+                    for move in game_record["moves"]
+                ]
+            )
+    else:
+        st.caption("No past moves yet — finish a game to see the log.")
 
 st.write(st.session_state.llm_status or "Press start to begin the series.")
 if st.session_state.allow_minimax:
@@ -1529,12 +1576,15 @@ with st.expander("How it works"):
         or leading, then drops by 1 for every 10-point deficit (down to 1) so trailing agents get
         an increasingly cheap bailout. No entry fee is ever refunded.
         Fees are never refunded, wins always grant +10 points, and losses/draws pay 0. There are
-        no mid-game requests, so the choice is locked at the opening move.
-        Press Start to watch twenty games with randomized opening seeds. After each matchup the app
-        logs who won, whether minimax was used, token usage, and cumulative standings. If an LLM
-        sends malformed JSON or repeats illegal moves we retry a few times; persistent problems
-        pause the series so you can intervene. When the series finishes you'll see analytics covering
-        wins/losses/draws, point totals, and minimax reliance.
+        no mid-game requests, so the choice is locked at the opening move, and LLMs now take the
+        very first move themselves.
+        Each move prompt also includes the last five completed games (results plus move lists) so the
+        models can adapt if they keep losing or drawing the same way.
+        Press Start to watch a series (default 20 games). After each matchup the app logs who won,
+        whether minimax was used, token usage, and cumulative standings. If an LLM sends malformed
+        JSON or repeats illegal moves we retry a few times; persistent problems pause the series so
+        you can intervene. When the series finishes you'll see analytics covering wins/losses/draws,
+        point totals, and minimax reliance.
         """
     )
 
